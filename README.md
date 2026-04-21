@@ -114,3 +114,33 @@ backend/
 .env                 # All API keys and tokens
 challenge/           # Provided case-study assets + mock server
 ```
+
+---
+
+## Future Improvements
+
+### Performance
+
+- **Batch LLM extraction**: extract multiple Teams messages in one Claude call
+  (JSON array) instead of one-call-per-message to reduce latency and token cost.
+- **Parallel stage execution**: run independent per-item enrichment/matching
+  work in parallel where safe.
+
+### Observability
+
+- **Structured logging** with per-item stage details:
+  - `stage`
+  - `duration_ms`
+  - `outcome`
+  - `error_code` (if failed)
+- **Basic metrics** dashboard/counters:
+  - extraction success rate
+  - skip rate
+  - average latency per stage
+
+### Configurability
+
+- Move operational knobs to `.env`, for example:
+  - `MAX_MESSAGES`
+  - duplicate confidence thresholds
+  - retry counts / retry backoff parameters
