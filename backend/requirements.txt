@@ -1,6 +1,6 @@
-anthropic
-gradio
-python-dotenv
-langgraph
-langchain-anthropic
-httpx
+anthropic>=0.40
+gradio>=4.44
+python-dotenv>=1.0
+langgraph>=0.2
+langchain-anthropic>=0.2
+httpx>=0.27
