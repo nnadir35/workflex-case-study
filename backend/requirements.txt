@@ -1,0 +1,6 @@
+anthropic
+gradio
+python-dotenv
+langgraph
+langchain-anthropic
+httpx
