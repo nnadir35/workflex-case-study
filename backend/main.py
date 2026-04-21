@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import os
 import traceback
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import gradio as gr
 from dotenv import load_dotenv
@@ -157,17 +159,61 @@ def process_messages(max_messages: int, progress=gr.Progress(track_tqdm=False)):
         "max_messages": int(max_messages),
         "log": [],
     }
-    progress(0.1, desc="Running LangGraph pipeline (this calls Claude per message)…")
-    try:
-        final_state = GRAPH.invoke(initial)
-    except Exception as e:  # noqa: BLE001
-        traceback.print_exc()
-        return (
-            [],                                        # agent_state
-            _render_fatal_error("Process Messages başarısız", e),
-            gr.update(interactive=False),              # confirm_btn
-            gr.update(value="", visible=False),        # results_output
-        )
+    progress(0.02, desc="Initializing pipeline...")
+    yield (
+        [],
+        (
+            "### ⏳ Processing messages...\n\n"
+            "- Pipeline started.\n"
+            "- Claude + API calls are running.\n"
+            "- Live status will refresh automatically."
+        ),
+        gr.update(interactive=False),
+        gr.update(value="", visible=False),
+    )
+
+    started = time.time()
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        future = ex.submit(GRAPH.invoke, initial)
+        heartbeat = 0
+        while not future.done():
+            heartbeat += 1
+            elapsed = time.time() - started
+            # Keep progress moving while backend work is running.
+            p = min(0.05 + heartbeat * 0.02, 0.92)
+            progress(
+                p,
+                desc=(
+                    f"Processing messages... "
+                    f"(running {int(elapsed)}s, heartbeat {heartbeat})"
+                ),
+            )
+            dots = "." * ((heartbeat % 3) + 1)
+            yield (
+                [],
+                (
+                    "### ⏳ Processing messages...\n\n"
+                    f"- Pipeline running{dots}\n"
+                    f"- Elapsed: **{int(elapsed)}s**\n"
+                    "- Waiting for LangGraph node completion..."
+                ),
+                gr.update(interactive=False),
+                gr.update(value="", visible=False),
+            )
+            time.sleep(0.8)
+
+        try:
+            final_state = future.result()
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            yield (
+                [],
+                _render_fatal_error("Process Messages failed", e),
+                gr.update(interactive=False),
+                gr.update(value="", visible=False),
+            )
+            return
+
     progress(1.0, desc="Drafts ready for review.")
 
     items = final_state.get("items", [])
@@ -175,7 +221,7 @@ def process_messages(max_messages: int, progress=gr.Progress(track_tqdm=False)):
 
     # Enable the confirm button only if there's at least one actionable item.
     actionable = any(i.get("action") in ("CREATE", "UPDATE") for i in items)
-    return (
+    yield (
         items,                                   # agent_state
         review_md,                               # review_output
         gr.update(interactive=actionable),       # confirm_btn
