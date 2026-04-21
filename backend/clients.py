@@ -336,12 +336,29 @@ class TeamsClient:
 
     def list_messages(self, top: int = 50) -> list[dict]:
         self._discover_channel()
-        r = self._request(
-            "GET",
-            f"/graph/v1.0/teams/{self.team_id}/channels/{self.channel_id}/messages",
-            params={"$top": top},
-        )
-        return r.json().get("value", [])
+        target = max(1, top)
+        page_size = min(target, 50)
+        path = f"/graph/v1.0/teams/{self.team_id}/channels/{self.channel_id}/messages"
+        params = {"$top": page_size}
+        out: list[dict] = []
+
+        # Follow Graph pagination so we can inspect older messages too.
+        while len(out) < target:
+            r = self._request("GET", path, params=params)
+            data = r.json()
+            out.extend(data.get("value", []))
+            next_link = data.get("@odata.nextLink")
+            if not next_link:
+                break
+
+            from urllib.parse import parse_qs, urlparse
+
+            parsed = urlparse(next_link)
+            path = parsed.path
+            q = parse_qs(parsed.query)
+            params = {k: v[-1] for k, v in q.items()}
+
+        return out[:target]
 
     def post_message(self, text: str) -> dict:
         self._discover_channel()

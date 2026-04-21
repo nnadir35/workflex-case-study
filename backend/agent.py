@@ -42,6 +42,8 @@ class Item(TypedDict, total=False):
     arr_display: str
     hubspot_match: Optional[str]
     duplicate_ticket: Optional[dict]  # {"key": str, "summary": str}
+    duplicate_confidence: Optional[float]
+    duplicate_reason: Optional[str]
     action: str                       # "UPDATE" | "CREATE"
     draft_title: Optional[str]
     draft_body: str
@@ -116,6 +118,54 @@ def _backlog_catalog(backlog: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _is_agent_feedback(text: str) -> bool:
+    t = (text or "").strip()
+    return t.startswith("Got it! Added to Ticket #") or t.startswith("Created new Ticket #")
+
+
+def _looks_like_feature_request(text: str) -> bool:
+    t = f" {(text or '').lower()} "
+    keywords = (
+        " wants ", " need ", " needs ", " asking ", " asked ", " looking for ",
+        " interested ", " integration ", " workflow ", " dashboard ", " export ",
+        " sso ", " saml ", " api ", " reminder ", " compliance ", " mobile ",
+        " permissions ", " rbac ", " upload ", " automation ",
+    )
+    return any(k in t for k in keywords)
+
+
+def _fallback_extract(sender: str, text: str) -> tuple[str, str]:
+    msg = " ".join((text or "").split())
+    if not _looks_like_feature_request(msg):
+        return "", ""
+
+    client = ""
+    for pattern in (
+        r"with\s+([A-Z][\w&.\- ]+?)(?:\.|,|$)",
+        r"from\s+([A-Z][\w&.\- ]+?)(?:\.|,|$)",
+        r"^([A-Z][\w&.\- ]+?)\s+(?:wants|needs|asked|is asking|is looking)",
+    ):
+        m = re.search(pattern, msg)
+        if m:
+            client = m.group(1).strip(" .,-")
+            break
+
+    request = ""
+    m = re.search(
+        r"(?:wants|needs|is asking|asked for|is looking for|interested in)\s+(.+)$",
+        msg,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        request = m.group(1).strip(" .")
+    elif "?" in msg:
+        request = msg.split("?", 1)[0].strip() + "?"
+    else:
+        request = msg[:240]
+
+    return client[:80], request[:240]
+
+
 # --------------------------------------------------------------------------- #
 # Graph nodes                                                                  #
 # --------------------------------------------------------------------------- #
@@ -125,14 +175,21 @@ def make_graph(jira: JiraClient, hubspot: HubSpotClient, teams: TeamsClient):
 
     # ---- Node: fetch Teams messages ---- #
     def fetch_messages(state: AgentState) -> AgentState:
-        raw = teams.list_messages(top=50)
+        raw = teams.list_messages(top=200)
 
-        # Ignore bot-authored messages (the agent's own feedback) and stay
-        # within max_messages. The mock server returns newest first.
-        human_msgs = [
+        non_bot = [
             m for m in raw
             if (m.get("from") or {}).get("user") is not None
-        ][: state.get("max_messages", 10)]
+            and not _is_agent_feedback((m.get("body") or {}).get("content", ""))
+        ]
+        feature_like = []
+        other = []
+        for m in non_bot:
+            text = (m.get("body") or {}).get("content", "")
+            (feature_like if _looks_like_feature_request(text) else other).append(m)
+
+        target = state.get("max_messages", 10)
+        human_msgs = (feature_like + other)[:target]
 
         # Oldest-first for a more natural review order in the UI.
         human_msgs.reverse()
@@ -140,7 +197,11 @@ def make_graph(jira: JiraClient, hubspot: HubSpotClient, teams: TeamsClient):
         return {
             **state,
             "messages": human_msgs,
-            "log": state.get("log", []) + [f"Fetched {len(human_msgs)} Teams messages."],
+            "log": state.get("log", [])
+            + [
+                f"Fetched {len(human_msgs)} Teams messages "
+                f"(from {len(non_bot)} human/non-bot candidates)."
+            ],
         }
 
     # ---- Node: fetch Jira backlog ---- #
@@ -183,23 +244,30 @@ def make_graph(jira: JiraClient, hubspot: HubSpotClient, teams: TeamsClient):
             )
             try:
                 data = _call_claude_json(system, user, max_tokens=300)
+                client = (data.get("client") or "").strip()
+                request = (data.get("request") or "").strip()
+                if not request:
+                    fb_client, fb_request = _fallback_extract(sender, text)
+                    client = client or fb_client
+                    request = fb_request
                 items.append({
                     "message_id": m["id"],
                     "sender": sender,
                     "text": text,
                     "requester": (data.get("requester") or sender).strip(),
-                    "client": (data.get("client") or "").strip(),
-                    "request": (data.get("request") or "").strip(),
+                    "client": client,
+                    "request": request,
                 })
             except Exception as e:  # noqa: BLE001
+                fb_client, fb_request = _fallback_extract(sender, text)
                 items.append({
                     "message_id": m["id"],
                     "sender": sender,
                     "text": text,
                     "requester": sender,
-                    "client": "",
-                    "request": "",
-                    "error": f"extract failed: {e}",
+                    "client": fb_client,
+                    "request": fb_request,
+                    "error": f"extract failed: {e}" if not fb_request else None,
                 })
 
         return {
@@ -248,7 +316,7 @@ def make_graph(jira: JiraClient, hubspot: HubSpotClient, teams: TeamsClient):
             "Two requests should be considered duplicates only if they ask for the same "
             "capability. Cosmetic rewording is fine; different features are NOT duplicates. "
             "Respond with ONLY a JSON object: "
-            '{"duplicate_key": "JIRA-XXXX" or null, "reason": "short explanation"}'
+            '{"duplicate_key": "JIRA-XXXX" or null, "confidence": 0.0-1.0, "reason": "short explanation"}'
         )
 
         updated: list[Item] = []
@@ -267,11 +335,22 @@ def make_graph(jira: JiraClient, hubspot: HubSpotClient, teams: TeamsClient):
                 "Return the JSON object."
             )
             dup_key = None
+            confidence: float | None = None
+            reason: str | None = None
             try:
                 data = _call_claude_json(system, user, max_tokens=300)
                 candidate = data.get("duplicate_key")
+                reason = str(data.get("reason") or "").strip() or None
+                raw_conf = data.get("confidence")
+                if raw_conf is not None:
+                    try:
+                        confidence = max(0.0, min(1.0, float(raw_conf)))
+                    except (TypeError, ValueError):
+                        confidence = None
                 if candidate and candidate in by_key:
                     dup_key = candidate
+                    if confidence is None:
+                        confidence = 0.5
             except Exception as e:  # noqa: BLE001
                 item = {**item, "error": f"match failed: {e}"}
 
@@ -280,9 +359,21 @@ def make_graph(jira: JiraClient, hubspot: HubSpotClient, teams: TeamsClient):
                     "key": dup_key,
                     "summary": by_key[dup_key]["summary"],
                 }
-                updated.append({**item, "duplicate_ticket": dup_ticket, "action": "UPDATE"})
+                updated.append({
+                    **item,
+                    "duplicate_ticket": dup_ticket,
+                    "duplicate_confidence": confidence,
+                    "duplicate_reason": reason,
+                    "action": "UPDATE",
+                })
             else:
-                updated.append({**item, "duplicate_ticket": None, "action": "CREATE"})
+                updated.append({
+                    **item,
+                    "duplicate_ticket": None,
+                    "duplicate_confidence": confidence,
+                    "duplicate_reason": reason,
+                    "action": "CREATE",
+                })
 
         creates = sum(1 for i in updated if i.get("action") == "CREATE")
         updates = sum(1 for i in updated if i.get("action") == "UPDATE")
@@ -416,7 +507,10 @@ def submit_all(
                 parent_key = item["duplicate_ticket"]["key"]
                 jira.add_comment(parent_key, item["draft_body"])
                 feedback = f"Got it! Added to Ticket #{parent_key}"
-                teams.post_message(feedback)
+                try:
+                    teams.reply_to_message(item["message_id"], feedback)
+                except Exception:  # noqa: BLE001
+                    teams.post_message(feedback)
                 result.update(ok=True, ticket_key=parent_key, feedback=feedback)
 
             elif action == "CREATE":
@@ -430,7 +524,10 @@ def submit_all(
                 feedback = (
                     f"Created new Ticket #{new_key} for {client_name} ({arr_display})"
                 )
-                teams.post_message(feedback)
+                try:
+                    teams.reply_to_message(item["message_id"], feedback)
+                except Exception:  # noqa: BLE001
+                    teams.post_message(feedback)
                 result.update(ok=True, ticket_key=new_key, feedback=feedback)
 
             else:  # SKIP
